@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+from dotenv import load_dotenv
 import tempfile
 import pandas as pd
 import PyPDF2
@@ -11,124 +12,394 @@ from dateutil.relativedelta import relativedelta
 import json
 import plotly.express as px
 import plotly.graph_objects as go
-from openai import OpenAI
+from groq import Groq
+import sqlite3
+import hashlib
+import uuid
+from typing import Dict, List, Optional
 
-# Custom CSS for better UI
-def set_custom_styling():
-    st.markdown("""
-    <style>
-    .stApp {
-        background-color: #0f55b8;
-        color: black;
-    }
-    .header-container {
-        background-color: #1a62c5;
-        padding: 1.5rem;
-        border-radius: 10px;
-        color: black;
-        margin-bottom: 2rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-    }
-    .card {
-        background-color: #1a62c5;
-        padding: 1.5rem;
-        border-radius: 10px;
-        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
-        margin-bottom: 1rem;
-        color: black;
-    }
-    .metric-container {
-        background-color: #2570d4;
-        padding: 1rem;
-        border-radius: 10px;
-        margin-bottom: 1rem;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
-        color: black;
-    }
-    .feedback-textarea {
-        border: 1px solid #3a78d9;
-        border-radius: 5px;
-        padding: 10px;
-        width: 100%;
-        background-color: #1a62c5;
-        color: black;
-    }
-    .skills-matched {
-        color: #006400;
-        font-weight: 500;
-    }
-    .skills-missing {
-        color: #8b0000;
-        font-weight: 500;
-    }
-    .chart-container {
-        background-color: #2570d4;
-        padding: 1.5rem;
-        border-radius: 10px;
-        margin-bottom: 1.5rem;
-        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
-    }
-    /* Make sure all text is black */
-    p, h1, h2, h3, h4, h5, h6, li, label, span {
-        color: black !important;
-    }
-    /* Make buttons more visible on blue background */
-    .stButton>button {
-        background-color: #ffffff;
-        color: #0f55b8;
-        border: none;
-        font-weight: bold;
-    }
-    .stButton>button:hover {
-        background-color: #e6e6e6;
-        color: #0f55b8;
-    }
-    /* Style select boxes for better visibility */
-    .stSelectbox [data-baseweb="select"] {
-        background-color: #2570d4;
-        color: black;
-    }
-    /* Style text inputs and text areas */
-    .stTextInput>div>div>input, .stTextArea textarea {
-        background-color: #2570d4;
-        color: black;
-        border: 1px solid #3a78d9;
-    }
-    /* Style dataframe for blue background */
-    .dataframe {
-        background-color: #2570d4;
-        color: black;
-    }
-    .dataframe th {
-        background-color: #1a62c5;
-        color: black;
-    }
-    /* Style tabs for blue background */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #2570d4;
-        color: black;
-        border-radius: 4px 4px 0 0;
-        padding: 10px 16px;
-        border: none;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #ffffff;
-        color: #0f55b8 !important;
-    }
-    /* API key input styling */
-    .api-key-container {
-        background-color: #1a62c5;
-        padding: 1rem;
-        border-radius: 10px;
-        margin-bottom: 1rem;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
-    }
-    </style>
-    """, unsafe_allow_html=True)
+# Load environment variables
+load_dotenv()
 
+# Updated Database setup function with better error handling
+def init_database():
+    """Initialize SQLite database with necessary tables and handle migrations."""
+    conn = sqlite3.connect('cv_analyzer.db')
+    cursor = conn.cursor()
+    
+    try:
+        # Users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                role TEXT DEFAULT 'candidate',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Jobs table - with all necessary columns
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                requirements TEXT NOT NULL,
+                department TEXT,
+                location TEXT,
+                salary_range TEXT,
+                created_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1,
+                FOREIGN KEY (created_by) REFERENCES users (id)
+            )
+        ''')
+        
+        # Applications table - with enhanced columns for additional information
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                candidate_id INTEGER,
+                cv_text TEXT,
+                match_score REAL,
+                skills_score REAL,
+                experience_score REAL,
+                matched_skills TEXT,
+                missing_skills TEXT,
+                analysis_result TEXT,
+                experience_summary TEXT,
+                status TEXT DEFAULT 'pending',
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- New application form fields
+                applicant_full_name TEXT,
+                applicant_email TEXT,
+                applicant_phone TEXT,
+                current_salary TEXT,
+                expected_salary TEXT,
+                total_experience TEXT,
+                FOREIGN KEY (job_id) REFERENCES jobs (id),
+                FOREIGN KEY (candidate_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # Handle existing database migration
+        # Check for missing columns and add them
+        cursor.execute("PRAGMA table_info(applications)")
+        existing_columns = [column[1] for column in cursor.fetchall()]
+        
+        # Define all required columns for applications table
+        required_columns = [
+            ('skills_score', 'REAL'),
+            ('experience_score', 'REAL'),
+            ('matched_skills', 'TEXT'),
+            ('missing_skills', 'TEXT'),
+            ('analysis_result', 'TEXT'),
+            ('experience_summary', 'TEXT'),
+            ('applicant_full_name', 'TEXT'),
+            ('applicant_email', 'TEXT'),
+            ('applicant_phone', 'TEXT'),
+            ('current_salary', 'TEXT'),
+            ('expected_salary', 'TEXT'),
+            ('total_experience', 'TEXT')
+        ]
+        
+        # Add missing columns
+        for column_name, column_type in required_columns:
+            if column_name not in existing_columns:
+                try:
+                    cursor.execute(f'ALTER TABLE applications ADD COLUMN {column_name} {column_type}')
+                    print(f"Added missing column: {column_name}")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e):
+                        print(f"Warning: Could not add column {column_name}: {e}")
+        
+        # Check jobs table for missing columns
+        cursor.execute("PRAGMA table_info(jobs)")
+        existing_job_columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'created_by' not in existing_job_columns:
+            try:
+                cursor.execute('ALTER TABLE jobs ADD COLUMN created_by INTEGER')
+                print("Added missing column: created_by to jobs table")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e):
+                    print(f"Warning: Could not add created_by column: {e}")
+        
+        if 'is_active' not in existing_job_columns:
+            try:
+                cursor.execute('ALTER TABLE jobs ADD COLUMN is_active BOOLEAN DEFAULT 1')
+                print("Added missing column: is_active to jobs table")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e):
+                    print(f"Warning: Could not add is_active column: {e}")
+        
+        conn.commit()
+        print("Database initialization completed successfully!")
+        
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+# Authentication functions
+def hash_password(password: str) -> str:
+    """Hash password using SHA256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify password against hash."""
+    return hash_password(password) == hashed
+
+def create_user(username: str, email: str, password: str, full_name: str, role: str = 'candidate') -> bool:
+    """Create a new user."""
+    try:
+        conn = sqlite3.connect('cv_analyzer.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO users (username, email, password_hash, full_name, role)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (username, email, hash_password(password), full_name, role))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def authenticate_user(username: str, password: str) -> Optional[Dict]:
+    """Authenticate user and return user data."""
+    conn = sqlite3.connect('cv_analyzer.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, username, email, full_name, role FROM users 
+        WHERE username = ? AND password_hash = ?
+    ''', (username, hash_password(password)))
+    user = cursor.fetchone()
+    conn.close()
+    
+    if user:
+        return {
+            'id': user[0],
+            'username': user[1],
+            'email': user[2],
+            'full_name': user[3],
+            'role': user[4]
+        }
+    return None
+
+# Job functions
+def get_all_jobs() -> List[Dict]:
+    """Get all active jobs."""
+    conn = sqlite3.connect('cv_analyzer.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT j.id, j.title, j.description, j.requirements, j.department, j.location, 
+               j.salary_range, j.created_at, u.full_name as created_by_name
+        FROM jobs j
+        LEFT JOIN users u ON j.created_by = u.id
+        WHERE j.is_active = 1 
+        ORDER BY j.created_at DESC
+    ''')
+    jobs = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        'id': job[0],
+        'title': job[1],
+        'description': job[2],
+        'requirements': job[3],
+        'department': job[4],
+        'location': job[5],
+        'salary_range': job[6],
+        'created_at': job[7],
+        'created_by_name': job[8]
+    } for job in jobs]
+
+def get_job_by_id(job_id: int) -> Optional[Dict]:
+    """Get job by ID."""
+    conn = sqlite3.connect('cv_analyzer.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT j.id, j.title, j.description, j.requirements, j.department, j.location, 
+               j.salary_range, j.created_by, j.created_at, u.full_name as created_by_name
+        FROM jobs j
+        LEFT JOIN users u ON j.created_by = u.id
+        WHERE j.id = ? AND j.is_active = 1
+    ''', (job_id,))
+    job = cursor.fetchone()
+    conn.close()
+    
+    if job:
+        return {
+            'id': job[0],
+            'title': job[1],
+            'description': job[2],
+            'requirements': job[3],
+            'department': job[4],
+            'location': job[5],
+            'salary_range': job[6],
+            'created_by': job[7],
+            'created_at': job[8],
+            'created_by_name': job[9]
+        }
+    return None
+
+def create_job(title: str, description: str, requirements: str, department: str, location: str, salary_range: str, created_by: int) -> bool:
+    """Create a new job posting."""
+    try:
+        conn = sqlite3.connect('cv_analyzer.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO jobs (title, description, requirements, department, location, salary_range, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (title, description, requirements, department, location, salary_range, created_by))
+        conn.commit()
+        conn.close()
+        return True
+    except:
+        return False
+
+def get_jobs_by_creator(creator_id: int) -> List[Dict]:
+    """Get jobs created by a specific HR user."""
+    conn = sqlite3.connect('cv_analyzer.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, title, description, requirements, department, location, salary_range, created_at
+        FROM jobs WHERE created_by = ? AND is_active = 1 ORDER BY created_at DESC
+    ''', (creator_id,))
+    jobs = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        'id': job[0],
+        'title': job[1],
+        'description': job[2],
+        'requirements': job[3],
+        'department': job[4],
+        'location': job[5],
+        'salary_range': job[6],
+        'created_at': job[7]
+    } for job in jobs]
+
+# Application functions
+def submit_application(job_id: int, candidate_id: int, cv_text: str, analysis_result: Dict, 
+                      applicant_info: Dict) -> bool:
+    """Submit a job application with additional applicant information."""
+    try:
+        conn = sqlite3.connect('cv_analyzer.db')
+        cursor = conn.cursor()
+        
+        # Check if user already applied for this job
+        cursor.execute('''
+            SELECT id FROM applications WHERE job_id = ? AND candidate_id = ?
+        ''', (job_id, candidate_id))
+        
+        if cursor.fetchone():
+            conn.close()
+            return False  # Already applied
+        
+        cursor.execute('''
+            INSERT INTO applications 
+            (job_id, candidate_id, cv_text, match_score, skills_score, experience_score, 
+             matched_skills, missing_skills, analysis_result, experience_summary, status,
+             applicant_full_name, applicant_email, applicant_phone, current_salary, 
+             expected_salary, total_experience)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            job_id, candidate_id, cv_text,
+            analysis_result.get('score', 0),
+            analysis_result.get('skills_match_score', 0),
+            analysis_result.get('experience_relevance_score', 0),
+            json.dumps(analysis_result.get('key_skills_matched', [])),
+            json.dumps(analysis_result.get('missing_skills', [])),
+            json.dumps(analysis_result),
+            analysis_result.get('experience_summary', ''),
+            'reviewed' if analysis_result.get('score', 0) >= 6 else 'rejected',
+            applicant_info.get('full_name', ''),
+            applicant_info.get('email', ''),
+            applicant_info.get('phone', ''),
+            applicant_info.get('current_salary', ''),
+            applicant_info.get('expected_salary', ''),
+            applicant_info.get('total_experience', '')
+        ))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Error submitting application: {str(e)}")
+        return False
+
+def get_applications_for_hr(hr_id: int) -> List[Dict]:
+    """Get applications for jobs created by specific HR user."""
+    conn = sqlite3.connect('cv_analyzer.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT a.id, j.title, u.full_name, u.email, a.match_score, a.skills_score, 
+               a.experience_score, a.status, a.applied_at, a.matched_skills, a.missing_skills,
+               a.experience_summary, a.analysis_result, j.id as job_id,
+               a.applicant_full_name, a.applicant_email, a.applicant_phone, 
+               a.current_salary, a.expected_salary, a.total_experience
+        FROM applications a
+        JOIN jobs j ON a.job_id = j.id
+        JOIN users u ON a.candidate_id = u.id
+        WHERE j.created_by = ?
+        ORDER BY a.applied_at DESC
+    ''', (hr_id,))
+    applications = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        'id': app[0],
+        'job_title': app[1],
+        'candidate_name': app[2],
+        'candidate_email': app[3],
+        'match_score': app[4],
+        'skills_score': app[5],
+        'experience_score': app[6],
+        'status': app[7],
+        'applied_at': app[8],
+        'matched_skills': json.loads(app[9]) if app[9] else [],
+        'missing_skills': json.loads(app[10]) if app[10] else [],
+        'experience_summary': app[11],
+        'analysis_result': json.loads(app[12]) if app[12] else {},
+        'job_id': app[13],
+        'applicant_full_name': app[14] or app[2],  # Fallback to username if not provided
+        'applicant_email': app[15] or app[3],      # Fallback to user email if not provided
+        'applicant_phone': app[16] or 'Not provided',
+        'current_salary': app[17] or 'Not provided',
+        'expected_salary': app[18] or 'Not provided',
+        'total_experience': app[19] or 'Not provided'
+    } for app in applications]
+
+def get_user_applications(user_id: int) -> List[Dict]:
+    """Get applications for a specific user."""
+    conn = sqlite3.connect('cv_analyzer.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT j.title, a.match_score, a.status, a.applied_at, a.skills_score, a.experience_score
+        FROM applications a
+        JOIN jobs j ON a.job_id = j.id
+        WHERE a.candidate_id = ?
+        ORDER BY a.applied_at DESC
+    ''', (user_id,))
+    applications = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        'job_title': app[0],
+        'match_score': app[1],
+        'status': app[2],
+        'applied_at': app[3],
+        'skills_score': app[4],
+        'experience_score': app[5]
+    } for app in applications]
+
+# CV Analysis functions
 def extract_text_from_pdf(pdf_file):
     """Extract text content from a PDF file with robust error handling."""
     try:
@@ -139,13 +410,11 @@ def extract_text_from_pdf(pdf_file):
             text += page.extract_text()
         return text
     except Exception as e:
-        # Return a placeholder message if PDF parsing fails
         print(f"Error parsing PDF: {str(e)}")
         return f"[Error extracting PDF content: {str(e)}. Please check if this is a valid PDF file.]"
 
 def extract_work_experience(cv_text, client):
-    """Extract work experience durations from the CV text with improved error handling."""
-    # Use OpenAI to extract work experience
+    """Extract work experience durations from the CV text using Groq."""
     prompt = f"""
     Extract all work experience entries from the CV text below. For each position, identify the start and end dates.
     If the end date is "Present" or "Current", use today's date.
@@ -171,20 +440,17 @@ def extract_work_experience(cv_text, client):
     try:
         response = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="gpt-4o",
+            model="llama3-8b-8192",
             temperature=0.2,
-            max_tokens=1000,
-            response_format={"type": "json_object"}  # Force JSON response format
+            max_tokens=1000
         )
         result = response.choices[0].message.content
         
-        # Ensure we have valid JSON
         try:
             experience_data = json.loads(result)
             return experience_data
         except json.JSONDecodeError as e:
             print(f"JSON decode error: {str(e)}")
-            # Fallback to empty work experience
             return {"work_experience": []}
             
     except Exception as e:
@@ -198,16 +464,13 @@ def calculate_total_experience(work_experience):
     
     for entry in work_experience.get("work_experience", []):
         try:
-            # Parse start date
             start_date_str = entry.get("start_date")
             if not start_date_str:
                 continue
                 
-            # Try to parse the date
             try:
                 start_date = parser.parse(start_date_str).date()
             except:
-                # If parsing fails, try to extract year and month
                 match = re.search(r'(\d{4})[-/]?(\d{1,2})', start_date_str)
                 if match:
                     year, month = match.groups()
@@ -215,7 +478,6 @@ def calculate_total_experience(work_experience):
                 else:
                     continue
             
-            # Parse end date
             end_date_str = entry.get("end_date", "")
             if end_date_str.lower() in ["present", "current", "now"]:
                 end_date = today
@@ -223,7 +485,6 @@ def calculate_total_experience(work_experience):
                 try:
                     end_date = parser.parse(end_date_str).date()
                 except:
-                    # If parsing fails, try to extract year and month
                     match = re.search(r'(\d{4})[-/]?(\d{1,2})', end_date_str)
                     if match:
                         year, month = match.groups()
@@ -231,7 +492,6 @@ def calculate_total_experience(work_experience):
                     else:
                         continue
             
-            # Calculate duration in months
             delta = relativedelta(end_date, start_date)
             months = delta.years * 12 + delta.months
             total_months += months
@@ -240,7 +500,6 @@ def calculate_total_experience(work_experience):
             print(f"Error calculating experience for entry {entry}: {str(e)}")
             continue
     
-    # Convert to years and months
     years = total_months // 12
     remaining_months = total_months % 12
     
@@ -252,7 +511,7 @@ def calculate_total_experience(work_experience):
     }
 
 def analyze_cv(cv_text, job_description, work_experience_data, client):
-    """Use OpenAI to analyze a CV against a job description, with improved error handling."""
+    """Use Groq to analyze a CV against a job description."""
     total_experience = calculate_total_experience(work_experience_data)
     
     prompt = f"""
@@ -287,20 +546,17 @@ def analyze_cv(cv_text, job_description, work_experience_data, client):
     try:
         response = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="gpt-4o",
+            model="llama3-8b-8192",
             temperature=0.2,
-            max_tokens=1000,
-            response_format={"type": "json_object"}  # Force JSON response format
+            max_tokens=1000
         )
         result = response.choices[0].message.content
         
-        # Validate JSON response
         try:
             json_result = json.loads(result)
             return json_result
         except json.JSONDecodeError:
             print(f"JSON decode error in analysis result: {result}")
-            # Create a fallback response
             return {
                 "score": 5,
                 "experience_relevance_score": 5,
@@ -323,1001 +579,654 @@ def analyze_cv(cv_text, job_description, work_experience_data, client):
             "experience_summary": "Analysis failed due to technical issues."
         }
 
-def generate_personalized_feedback(cv_text, job_description, analysis_result, client):
-    """Generate detailed personalized feedback for a specific CV."""
-    try:
-        # Ensure analysis_result is a dictionary
-        if isinstance(analysis_result, str):
-            try:
-                analysis_result = json.loads(analysis_result)
-            except json.JSONDecodeError:
-                # If we can't parse it, create a minimal structure
-                analysis_result = {
-                    "score": 5,
-                    "skills_match_score": 5,
-                    "experience_relevance_score": 5,
-                    "key_skills_matched": [],
-                    "missing_skills": []
-                }
-        
-        prompt = f"""
-        You are an expert HR advisor. Based on the CV and job description below, provide personalized feedback to the candidate.
-        
-        Job Description:
-        {job_description}
-        
-        Candidate CV:
-        {cv_text}
-        
-        Analysis Results:
-        - Match Score: {analysis_result.get('score', 'N/A')}/10
-        - Skills Match Score: {analysis_result.get('skills_match_score', 'N/A')}/10
-        - Experience Relevance Score: {analysis_result.get('experience_relevance_score', 'N/A')}/10
-        - Matched Skills: {', '.join(analysis_result.get('key_skills_matched', []))}
-        - Missing Skills: {', '.join(analysis_result.get('missing_skills', []))}
-        
-        Create personalized feedback with the following sections:
-        1. Strengths: What makes this candidate suitable for the position
-        2. Areas for Improvement: What skills or experiences they should develop
-        3. Resume Enhancement Tips: How to better highlight their relevant experiences 
-        4. Interview Preparation: Key points to emphasize during interviews
-        
-        Keep your response well-structured but conversational and constructive. Aim to be helpful and provide actionable advice.
-        """
-        
-        response = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="gpt-4o",
-            temperature=0.5,
-            max_tokens=1500
-        )
-        result = response.choices[0].message.content
-        return result
-    except Exception as e:
-        return f"Error generating personalized feedback: {str(e)}"
+# Custom CSS for better UI
+def set_custom_styling():
+    st.markdown("""
+    <style>
+    .stApp {
+        background-color: #0f55b8;
+        color: black;
+    }
+    .header-container {
+        background-color: #1a62c5;
+        padding: 1.5rem;
+        border-radius: 10px;
+        color: black;
+        margin-bottom: 2rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    }
+    .card {
+        background-color: #1a62c5;
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        margin-bottom: 1rem;
+        color: black;
+    }
+    .job-card {
+        background-color: #2570d4;
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        margin-bottom: 1rem;
+        color: black;
+        border-left: 4px solid #4caf50;
+    }
+    .metric-container {
+        background-color: #2570d4;
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 1rem;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+        color: black;
+    }
+    .login-container {
+        background-color: #1a62c5;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+        max-width: 400px;
+        margin: 2rem auto;
+        color: black;
+    }
+    .application-detail {
+        background-color: #1a62c5;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+        margin: 1rem 0;
+        color: black;
+        border: 2px solid #4caf50;
+    }
+    .application-form {
+        background-color: #1a62c5;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+        margin: 1rem 0;
+        color: black;
+        border: 2px solid #2196f3;
+    }
+    p, h1, h2, h3, h4, h5, h6, li, label, span {
+        color: black !important;
+    }
+    .stButton>button {
+        background-color: #ffffff;
+        color: #0f55b8;
+        border: none;
+        font-weight: bold;
+        border-radius: 5px;
+        padding: 0.5rem 1rem;
+    }
+    .stButton>button:hover {
+        background-color: #e6e6e6;
+        color: #0f55b8;
+    }
+    .apply-button {
+        background-color: #4caf50 !important;
+        color: white !important;
+    }
+    .apply-button:hover {
+        background-color: #45a049 !important;
+    }
+    .score-high {
+        color: #4caf50 !important;
+        font-weight: bold;
+    }
+    .score-medium {
+        color: #ff9800 !important;
+        font-weight: bold;
+    }
+    .score-low {
+        color: #f44336 !important;
+        font-weight: bold;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-def create_gauge_chart(value, title, max_value=10):
-    """Create a gauge chart for displaying scores."""
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        domain={'x': [0, 1], 'y': [0, 1]},
-        title={'text': title, 'font': {'color': 'black', 'size': 16}},  # Changed color to black
-        gauge={
-            'axis': {'range': [0, max_value], 'tickcolor': 'black'},  # Changed color to black
-            'bar': {'color': get_score_color(value)},
-            'steps': [
-                {'range': [0, 4], 'color': 'rgba(239, 83, 80, 0.2)'},
-                {'range': [4, 7], 'color': 'rgba(255, 205, 86, 0.2)'},
-                {'range': [7, 10], 'color': 'rgba(76, 175, 80, 0.2)'}
-            ],
-            'threshold': {
-                'line': {'color': 'black', 'width': 4},  # Changed color to black
-                'thickness': 0.75,
-                'value': value
-            }
-        }
-    ))
+def login_page():
+    """Display login/registration page."""
+    st.markdown('<div class="header-container"><h1>CV Analyzer Platform</h1><p>Login or Register to Continue</p></div>', unsafe_allow_html=True)
     
-    fig.update_layout(
-        height=250, 
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font={'color': 'black'},  # Changed color to black
-        margin=dict(l=20, r=20, t=50, b=20)
-    )
+    tab1, tab2 = st.tabs(["Login", "Register"])
     
-    return fig
-
-def get_score_color(score):
-    """Get color based on score value."""
-    if score >= 8:
-        return 'rgb(76, 175, 80)'  # Green
-    elif score >= 6:
-        return 'rgb(255, 205, 86)'  # Yellow
-    else:
-        return 'rgb(239, 83, 80)'   # Red
-
-def create_radar_chart(candidate_data):
-    """Create a radar chart showing candidate skills vs job requirements."""
-    # Create data for radar chart
-    categories = ['Overall Match', 'Skills Match', 'Experience Relevance']
-    values = [
-        candidate_data.get('score', 0),
-        candidate_data.get('skills_match_score', 0),
-        candidate_data.get('experience_relevance_score', 0)
-    ]
-    
-    # Create radar chart
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatterpolar(
-        r=values,
-        theta=categories,
-        fill='toself',
-        name='Candidate',
-        line_color='rgb(76, 175, 80)',
-        fillcolor='rgba(76, 175, 80, 0.3)'
-    ))
-    
-    fig.add_trace(go.Scatterpolar(
-        r=[10, 10, 10],
-        theta=categories,
-        fill='toself',
-        name='Ideal Candidate',
-        line_color='rgba(0, 0, 0, 0.5)',  # Changed color to black
-        fillcolor='rgba(0, 0, 0, 0.1)'  # Changed color to black
-    ))
-    
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(
-                visible=True,
-                range=[0, 10],
-                tickfont=dict(color='black')  # Changed color to black
-            ),
-            angularaxis=dict(
-                tickfont=dict(color='black')  # Changed color to black
-            )
-        ),
-        showlegend=True,
-        legend=dict(font=dict(color='black')),  # Changed color to black
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        height=350,
-        margin=dict(l=40, r=40, t=40, b=40)
-    )
-    
-    return fig
-
-def create_skills_chart(matched_skills, missing_skills):
-    """Create a horizontal bar chart showing matched vs missing skills."""
-    all_skills = matched_skills + missing_skills
-    
-    # Handle the case with no skills identified
-    if not all_skills:
-        all_skills = ["No specific skills identified"]
-        skill_status = ["Missing"]
-    else:
-        skill_status = ['Matched'] * len(matched_skills) + ['Missing'] * len(missing_skills)
-    
-    df = pd.DataFrame({
-        'Skill': all_skills,
-        'Status': skill_status,
-        'Value': [1] * len(all_skills)  # Each skill has equal weight for visualization
-    })
-    
-    # Create a color map
-    color_map = {'Matched': '#4caf50', 'Missing': '#f44336'}
-    
-    fig = px.bar(
-        df, 
-        y='Skill', 
-        x='Value', 
-        color='Status',
-        color_discrete_map=color_map,
-        orientation='h',
-        title='Skills Assessment',
-        text='Status'
-    )
-    
-    fig.update_layout(
-        xaxis_title="",
-        yaxis_title="",
-        xaxis={'visible': False},
-        showlegend=True,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font={'color': 'black'},  # Changed color to black
-        height=max(250, 50 * len(all_skills)),  # Dynamic height based on number of skills
-        margin=dict(l=20, r=20, t=50, b=20)
-    )
-    
-    fig.update_traces(textposition='inside', textfont_color='white')
-    
-    return fig
-
-def create_candidates_comparison_chart(results):
-    """Create a horizontal bar chart comparing candidates by overall score."""
-    # Check if results are empty
-    if not results:
-        # Create a placeholder chart
-        fig = go.Figure()
-        fig.add_annotation(
-            text="No candidates to compare",
-            xref="paper", yref="paper",
-            x=0.5, y=0.5, showarrow=False,
-            font=dict(size=20, color="black")
-        )
-        fig.update_layout(
-            height=350,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)'
-        )
-        return fig
-    
-    # Sort results by score
-    sorted_results = sorted(results, key=lambda x: x.get('score', 0), reverse=True)
-    
-    # Extract names and scores
-    names = [f"#{i+1}: {r['filename'].split('.')[0]}" for i, r in enumerate(sorted_results)]
-    scores = [r.get('score', 0) for r in sorted_results]
-    skills_scores = [r.get('skills_match_score', 0) for r in sorted_results]
-    exp_scores = [r.get('experience_relevance_score', 0) for r in sorted_results]
-    
-    fig = go.Figure()
-    
-    # Add overall score bars with consistent color
-    fig.add_trace(go.Bar(
-        y=names,
-        x=scores,
-        orientation='h',
-        name='Overall Match',
-        marker_color='rgb(76, 175, 80)',  # Fixed green color
-        text=[f"{s}/10" for s in scores],
-        textposition='auto',
-    ))
-    
-    # Add skills score bars
-    fig.add_trace(go.Bar(
-        y=names,
-        x=skills_scores,
-        orientation='h',
-        name='Skills Match',
-        marker_color='rgba(33, 150, 243, 0.8)',  # Blue color
-        text=[f"{s}/10" for s in skills_scores],
-        textposition='auto',
-    ))
-    
-    # Add experience score bars
-    fig.add_trace(go.Bar(
-        y=names,
-        x=exp_scores,
-        orientation='h',
-        name='Experience',
-        marker_color='rgba(255, 152, 0, 0.8)',  # Orange color
-        text=[f"{s}/10" for s in exp_scores],
-        textposition='auto',
-    ))
-    
-    # Update layout
-    fig.update_layout(
-        title='Candidate Comparison',
-        xaxis_title='Score (0-10)',
-        yaxis_title='Candidates',
-        barmode='group',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font={'color': 'black'},  # Changed color to black
-        legend={'font': {'color': 'black'}},  # Changed color to black
-        height=max(350, 60 * len(names)),  # Dynamic height based on number of candidates
-        margin=dict(l=20, r=20, t=50, b=20),
-        xaxis=dict(range=[0, 10])
-    )
-    
-    return fig
-
-def create_top_candidates_pie_chart(results):
-    """Create a pie chart showing top candidates distribution by category."""
-    # Check if results are empty
-    if not results:
-        # Create a placeholder chart
-        fig = go.Figure()
-        fig.add_annotation(
-            text="No candidates to categorize",
-            xref="paper", yref="paper",
-            x=0.5, y=0.5, showarrow=False, 
-            font=dict(size=20, color="black")
-        )
-        fig.update_layout(
-            height=350,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)'
-        )
-        return fig
-    
-    # Categorize candidates by score
-    excellent = sum(1 for r in results if r.get('score', 0) >= 8)
-    good = sum(1 for r in results if 6 <= r.get('score', 0) < 8)
-    average = sum(1 for r in results if 4 <= r.get('score', 0) < 6)
-    poor = sum(1 for r in results if r.get('score', 0) < 4)
-    
-    # Create pie chart
-    labels = ['Excellent (8-10)', 'Good (6-7)', 'Average (4-5)', 'Poor (0-3)']
-    values = [excellent, good, average, poor]
-    colors = ['rgb(76, 175, 80)', 'rgb(255, 205, 86)', 'rgb(255, 152, 0)', 'rgb(239, 83, 80)']
-    
-    # Filter out categories with zero candidates
-    non_zero_labels = []
-    non_zero_values = []
-    non_zero_colors = []
-    
-    for i, value in enumerate(values):
-        if value > 0:
-            non_zero_labels.append(labels[i])
-            non_zero_values.append(value)
-            non_zero_colors.append(colors[i])
-    
-    # If all categories are zero, add a placeholder
-    if not non_zero_values:
-        non_zero_labels = ['No candidates']
-        non_zero_values = [1]
-        non_zero_colors = ['gray']
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=non_zero_labels,
-        values=non_zero_values,
-        hole=.4,
-        marker_colors=non_zero_colors
-    )])
-    
-    fig.update_layout(
-        title='Candidates by Category',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font={'color': 'black'},  # Changed color to black
-        height=350,
-        margin=dict(l=20, r=20, t=50, b=20),
-        legend={'font': {'color': 'black'}}  # Changed color to black
-    )
-    
-    # Add count annotations
-    fig.update_traces(
-        textinfo='label+percent+value',
-        textposition='inside',
-        insidetextorientation='radial'
-    )
-    
-    return fig
-
-def generate_interview_questions(cv_text, job_description, analysis_result, client):
-    """Generate relevant interview questions and expected answers based on the CV and job requirements."""
-    try:
-        # Ensure analysis_result is a dictionary
-        if isinstance(analysis_result, str):
-            try:
-                analysis_result = json.loads(analysis_result)
-            except json.JSONDecodeError:
-                # If we can't parse it, create a minimal structure
-                analysis_result = {
-                    "score": 5,
-                    "key_skills_matched": [],
-                    "missing_skills": []
-                }
+    with tab1:
+        st.markdown('<div class="login-container">', unsafe_allow_html=True)
+        st.subheader("Login")
         
-        prompt = f"""
-        You are an expert HR interviewer. Based on the CV and job description below, create a set of interview questions
-        with expected answers that would help assess this candidate thoroughly.
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Login")
+            
+            if submit:
+                user = authenticate_user(username, password)
+                if user:
+                    st.session_state.user = user
+                    st.success("Login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
         
-        Job Description:
-        {job_description}
-        
-        Candidate CV:
-        {cv_text}
-        
-        Analysis Results:
-        - Match Score: {analysis_result.get('score', 'N/A')}/10
-        - Matched Skills: {', '.join(analysis_result.get('key_skills_matched', []))}
-        - Missing Skills: {', '.join(analysis_result.get('missing_skills', []))}
-        
-        Generate 10 interview questions with expected answers across these categories:
-        1. Technical Skills Assessment (questions specific to the technical skills in the CV)
-        2. Experience Validation (questions about specific projects or roles mentioned in the CV)
-        3. Behavioral Questions (relevant to the job requirements)
-        4. Problem-Solving (scenario-based questions related to the role)
-        5. Cultural Fit & Motivation
-        
-        For each question:
-        - Provide the rationale for asking this question
-        - Describe what a strong answer would include
-        - Include red flags to watch for
-        
-        Format your response in clear sections with markdown formatting.
-        """
-        
-        response = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="gpt-4o",
-            temperature=0.5,
-            max_tokens=2000
-        )
-        result = response.choices[0].message.content
-        return result
-    except Exception as e:
-        return f"Error generating interview questions: {str(e)}"
-
-def initialize_session_state():
-    """Initialize all session state variables."""
-    if 'openai_api_key' not in st.session_state:
-        st.session_state.openai_api_key = ""
-    if 'client' not in st.session_state:
-        st.session_state.client = None
-    if 'cv_data' not in st.session_state:
-        st.session_state.cv_data = {}
-    if 'job_description' not in st.session_state:
-        st.session_state.job_description = ""
-    if 'results' not in st.session_state:
-        st.session_state.results = []
-    if 'feedback' not in st.session_state:
-        st.session_state.feedback = {}
-    if 'generated_feedback' not in st.session_state:
-        st.session_state.generated_feedback = {}
-    if 'interview_questions' not in st.session_state:
-        st.session_state.interview_questions = {}
-    if 'error_log' not in st.session_state:
-        st.session_state.error_log = []
-    # Sample job description for first-time users
-    if 'sample_job_description' not in st.session_state:
-        st.session_state.sample_job_description = """
-        Job Title: Full Stack Developer
-        
-        About the Role:
-        We are looking for a skilled Full Stack Developer to join our innovative team. You will be responsible for developing and maintaining web applications, working on both front-end and back-end code.
-        
-        Key Responsibilities:
-        - Develop front-end website architecture using React.js and Next.js
-        - Design and build backend systems using Python/Django
-        - Work with databases and integrate with external APIs
-        - Ensure cross-platform optimization and responsiveness of applications
-        - Implement security and data protection measures
-        - Collaborate with other team members and stakeholders
-        
-        Requirements:
-        - 2+ years of experience in full stack development
-        - Proficiency in JavaScript, HTML, CSS, and React.js framework
-        - Experience with Next.js and server-side rendering
-        - Strong knowledge of Python and Django web framework
-        - Familiarity with database technologies (SQL, NoSQL)
-        - Understanding of server-side CSS preprocessors
-        - Knowledge of code versioning tools (Git)
-        - Experience with API integration
-        - Familiarity with AWS cloud services
-        - Understanding of AI tools and integration is a plus
-        - Excellent problem-solving and communication skills
-        """
-def main():
-    """Main application function."""
-    # Initialize session state
-    initialize_session_state()
-    
-    # Apply custom styling
-    set_custom_styling()
-    
-    # Create header
-    st.markdown('<div class="header-container"><h1>CV Analyzer</h1><p>Upload CVs and match them against job descriptions</p></div>', unsafe_allow_html=True)
-    
-    # API Key input
-    with st.expander("API Settings", expanded=not st.session_state.openai_api_key):
-        st.markdown('<div class="api-key-container">', unsafe_allow_html=True)
-        api_key = st.text_input("Enter your OpenAI API Key:", value=st.session_state.openai_api_key, type="password")
-        if api_key:
-            st.session_state.openai_api_key = api_key
-            try:
-                st.session_state.client = OpenAI(api_key=api_key)
-                st.success("API key set successfully!")
-            except Exception as e:
-                st.error(f"Error with API key: {str(e)}")
-                st.session_state.client = None
         st.markdown('</div>', unsafe_allow_html=True)
     
-    # Main interface with tabs
-    tabs = st.tabs(["Analysis", "Dashboard", "Comparison", "Help"])
+    with tab2:
+        st.markdown('<div class="login-container">', unsafe_allow_html=True)
+        st.subheader("Register")
+        
+        with st.form("register_form"):
+            reg_username = st.text_input("Username", key="reg_username")
+            reg_email = st.text_input("Email", key="reg_email")
+            reg_full_name = st.text_input("Full Name", key="reg_full_name")
+            reg_password = st.text_input("Password", type="password", key="reg_password")
+            reg_confirm_password = st.text_input("Confirm Password", type="password", key="reg_confirm_password")
+            role = st.selectbox("Role", ["candidate", "hr"])
+            register = st.form_submit_button("Register")
+            
+            if register:
+                if reg_password != reg_confirm_password:
+                    st.error("Passwords do not match")
+                elif len(reg_password) < 6:
+                    st.error("Password must be at least 6 characters")
+                elif create_user(reg_username, reg_email, reg_password, reg_full_name, role):
+                    st.success("Registration successful! Please login.")
+                else:
+                    st.error("Username or email already exists")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+def job_detail_page(job):
+    """Display detailed job information and application form."""
+    st.markdown('<div class="application-detail">', unsafe_allow_html=True)
     
-    with tabs[0]:  # Analysis Tab
-        col1, col2 = st.columns([1, 1])
+    # Back button
+    if st.button("← Back to Jobs", type="secondary"):
+        if 'selected_job' in st.session_state:
+            del st.session_state.selected_job
+        st.rerun()
+    
+    st.markdown(f"# {job['title']}")
+    st.markdown(f"**Department:** {job['department']}")
+    st.markdown(f"**Location:** {job['location']}")
+    st.markdown(f"**Salary Range:** {job['salary_range']}")
+    st.markdown(f"**Posted by:** {job['created_by_name']}")
+    st.markdown(f"**Posted on:** {job['created_at']}")
+    
+    st.markdown("---")
+    
+    st.markdown("## Job Description")
+    st.markdown(job['description'])
+    
+    st.markdown("## Requirements")
+    st.markdown(job['requirements'])
+    
+    st.markdown("---")
+    
+    # Application form
+    st.markdown("## Apply for This Position")
+    
+    st.markdown('<div class="application-form">', unsafe_allow_html=True)
+    
+    with st.form("application_form"):
+        st.markdown("### Personal Information")
         
+        # Pre-fill with user data where available
+        full_name = st.text_input("Full Name *", value=st.session_state.user.get('full_name', ''))
+        email = st.text_input("Email Address *", value=st.session_state.user.get('email', ''))
+        phone = st.text_input("Phone Number *", placeholder="e.g., +1-234-567-8900")
+        
+        st.markdown("### Professional Information")
+        
+        col1, col2 = st.columns(2)
         with col1:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Step 1: Enter Job Description")
-            
-            # Job description input
-            job_description = st.text_area(
-                "Job Description:", 
-                value=st.session_state.job_description if st.session_state.job_description else st.session_state.sample_job_description,
-                height=300
-            )
-            if job_description:
-                st.session_state.job_description = job_description
-            st.markdown('</div>', unsafe_allow_html=True)
-        
+            current_salary = st.text_input("Current Salary", placeholder="e.g., $50,000 or Not Applicable (if not currently employed)")
         with col2:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Step 2: Upload CVs")
-            
-            # CV upload
-            uploaded_files = st.file_uploader("Upload CVs (PDF format)", type="pdf", accept_multiple_files=True)
-            
-            if uploaded_files:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                # Process each CV
-                for i, file in enumerate(uploaded_files):
-                    if not st.session_state.client:
-                        st.error("Please enter a valid OpenAI API key first.")
-                        break
-                        
-                    status_text.text(f"Processing {file.name}... ({i+1}/{len(uploaded_files)})")
-                    
-                    # Extract text from PDF
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                        temp_file.write(file.read())
-                        temp_file_path = temp_file.name
-                    
-                    # Extract and process CV text
+            expected_salary = st.text_input("Expected Salary", placeholder="e.g., $60,000")
+        
+        total_experience = st.text_input("Total Years of Experience *", placeholder="e.g., 3.5 years")
+        
+        st.markdown("### Upload Your CV")
+        uploaded_file = st.file_uploader("Choose your CV file", type=['pdf', 'txt'])
+        
+        # Additional information
+        st.markdown("### Additional Information (Optional)")
+        cover_letter = st.text_area("Cover Letter / Additional Comments", 
+                                   placeholder="Tell us why you're interested in this position...")
+        
+        submit_application = st.form_submit_button("Submit Application", type="primary")
+        
+        if submit_application:
+            # Validation
+            if not all([full_name, email, phone, total_experience, uploaded_file]):
+                st.error("Please fill in all required fields (*) and upload your CV.")
+            else:
+                # Process the CV
+                with st.spinner("Processing your application..."):
                     try:
-                        cv_text = extract_text_from_pdf(temp_file_path)
-                        os.unlink(temp_file_path)  # Clean up temp file
+                        # Initialize Groq client
+                        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
                         
-                        # Store CV text
-                        st.session_state.cv_data[file.name] = cv_text
+                        # Extract text from uploaded file
+                        if uploaded_file.type == "application/pdf":
+                            cv_text = extract_text_from_pdf(uploaded_file)
+                        else:
+                            cv_text = str(uploaded_file.read(), "utf-8")
                         
                         # Extract work experience
-                        work_experience = extract_work_experience(cv_text, st.session_state.client)
+                        work_experience_data = extract_work_experience(cv_text, client)
                         
-                        # Analyze CV against job description
-                        result = analyze_cv(cv_text, job_description, work_experience, st.session_state.client)
-                        result['filename'] = file.name
+                        # Analyze CV
+                        job_requirements = f"{job['description']}\n\nRequirements:\n{job['requirements']}"
+                        analysis_result = analyze_cv(cv_text, job_requirements, work_experience_data, client)
                         
-                        # Check if CV is already in results, update if exists
-                        existing_index = next((i for i, r in enumerate(st.session_state.results) if r['filename'] == file.name), None)
-                        if existing_index is not None:
-                            st.session_state.results[existing_index] = result
-                        else:
-                            st.session_state.results.append(result)
+                        # Prepare applicant information
+                        applicant_info = {
+                            'full_name': full_name,
+                            'email': email,
+                            'phone': phone,
+                            'current_salary': current_salary,
+                            'expected_salary': expected_salary,
+                            'total_experience': total_experience,
+                            'cover_letter': cover_letter
+                        }
+                        
+                        # Submit application
+                        if submit_application_db(job['id'], st.session_state.user['id'], 
+                                               cv_text, analysis_result, applicant_info):
+                            st.success("Application submitted successfully!")
+                            st.balloons()
+                            
+                            # Show analysis results
                             
                     except Exception as e:
-                        error_msg = f"Error processing {file.name}: {str(e)}"
-                        st.error(error_msg)
-                        st.session_state.error_log.append(error_msg)
-                    
-                    # Update progress
-                    progress_bar.progress((i + 1) / len(uploaded_files))
-                
-                status_text.text(f"Processed {len(uploaded_files)} CV(s) successfully!")
-                time.sleep(1)
-                status_text.empty()
-                progress_bar.empty()
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Display results if available
-        if st.session_state.results:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Analysis Results")
-            
-            # Create selectbox for choosing CV
-            cv_options = [f"{r['filename']} (Score: {r['score']}/10)" for r in st.session_state.results]
-            selected_cv = st.selectbox("Select a CV to view detailed analysis:", cv_options)
-            
-            if selected_cv:
-                # Get the selected CV data
-                selected_filename = selected_cv.split(" (Score")[0]
-                selected_data = next((r for r in st.session_state.results if r['filename'] == selected_filename), None)
-                
-                if selected_data:
-                    # Display scores and charts
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                        st.plotly_chart(create_gauge_chart(selected_data.get('score', 0), "Overall Match Score"), use_container_width=True)
-                        st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    with col2:
-                        st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                        st.plotly_chart(create_radar_chart(selected_data), use_container_width=True)
-                        st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    # Display skills chart
-                    st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-                    matched_skills = selected_data.get('key_skills_matched', [])
-                    missing_skills = selected_data.get('missing_skills', [])
-                    
-                    # Display skills match visualization
-                    st.plotly_chart(create_skills_chart(matched_skills, missing_skills), use_container_width=True)
-                    
-                    # Show matched and missing skills
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("### Skills Matched")
-                        if matched_skills:
-                            for skill in matched_skills:
-                                st.markdown(f"<p class='skills-matched'>✓ {skill}</p>", unsafe_allow_html=True)
-                        else:
-                            st.markdown("<p>No matched skills identified</p>", unsafe_allow_html=True)
-                    
-                    with col2:
-                        st.markdown("### Skills Missing")
-                        if missing_skills:
-                            for skill in missing_skills:
-                                st.markdown(f"<p class='skills-missing'>✗ {skill}</p>", unsafe_allow_html=True)
-                        else:
-                            st.markdown("<p>No missing skills identified</p>", unsafe_allow_html=True)
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    # Display explanation
-                    st.markdown('<div class="card">', unsafe_allow_html=True)
-                    st.subheader("Analysis Summary")
-                    st.markdown(f"**Overall Score:** {selected_data.get('score', 0)}/10")
-                    st.markdown(f"**Skills Match Score:** {selected_data.get('skills_match_score', 0)}/10")
-                    st.markdown(f"**Experience Relevance Score:** {selected_data.get('experience_relevance_score', 0)}/10")
-                    st.markdown(f"**Explanation:** {selected_data.get('explanation', 'No explanation available.')}")
-                    
-                    # Display experience summary
-                    if 'experience_summary' in selected_data:
-                        st.markdown(f"**Experience Summary:** {selected_data['experience_summary']}")
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    # Generate detailed feedback
-                    st.markdown('<div class="card">', unsafe_allow_html=True)
-                    st.subheader("Personalized Feedback")
-                    
-                    if st.button("Generate Personalized Feedback", key=f"feedback_{selected_filename}"):
-                        try:
-                            with st.spinner("Generating personalized feedback..."):
-                                cv_text = st.session_state.cv_data.get(selected_filename, "")
-                                feedback = generate_personalized_feedback(
-                                    cv_text, 
-                                    st.session_state.job_description, 
-                                    selected_data,
-                                    st.session_state.client
-                                )
-                                st.session_state.generated_feedback[selected_filename] = feedback
-                        except Exception as e:
-                            st.error(f"Error generating feedback: {str(e)}")
-                    
-                    # Display feedback if available
-                    if selected_filename in st.session_state.generated_feedback:
-                        st.markdown(st.session_state.generated_feedback[selected_filename])
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    # Generate interview questions
-                    st.markdown('<div class="card">', unsafe_allow_html=True)
-                    st.subheader("Interview Preparation")
-                    
-                    if st.button("Generate Interview Questions", key=f"questions_{selected_filename}"):
-                        try:
-                            with st.spinner("Generating interview questions..."):
-                                cv_text = st.session_state.cv_data.get(selected_filename, "")
-                                questions = generate_interview_questions(
-                                    cv_text, 
-                                    st.session_state.job_description, 
-                                    selected_data,
-                                    st.session_state.client
-                                )
-                                st.session_state.interview_questions[selected_filename] = questions
-                        except Exception as e:
-                            st.error(f"Error generating interview questions: {str(e)}")
-                    
-                    # Display interview questions if available
-                    if selected_filename in st.session_state.interview_questions:
-                        st.markdown(st.session_state.interview_questions[selected_filename])
-                    st.markdown('</div>', unsafe_allow_html=True)
+                        st.error(f"Error processing application: {str(e)}")
     
-    with tabs[1]:  # Dashboard Tab
-        if not st.session_state.results:
-            st.info("Upload and analyze CVs to view the dashboard")
-        else:
-            # Create a dashboard with charts and analytics
-            st.markdown('<div class="header-container"><h2>CV Analysis Dashboard</h2></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def submit_application_db(job_id, candidate_id, cv_text, analysis_result, applicant_info):
+    """Submit application to database - wrapper function for better error handling"""
+    return submit_application(job_id, candidate_id, cv_text, analysis_result, applicant_info)
+
+def candidate_dashboard():
+    """Display candidate dashboard with job listings and applications."""
+    st.markdown('<div class="header-container"><h1>Welcome, ' + st.session_state.user['full_name'] + '</h1><p>Find your dream job</p></div>', unsafe_allow_html=True)
+    
+    # Sidebar navigation
+    st.sidebar.title("Navigation")
+    page = st.sidebar.selectbox("Select Page", ["Browse Jobs", "My Applications", "Profile"])
+    
+    if page == "Browse Jobs":
+        st.markdown("## Available Jobs")
+        
+        # Get all jobs
+        jobs = get_all_jobs()
+        
+        if not jobs:
+            st.info("No jobs available at the moment.")
+            return
+        
+        # Display jobs in a grid
+        for job in jobs:
+            st.markdown('<div class="job-card">', unsafe_allow_html=True)
             
-            # Display metrics
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns([3, 1])
             
             with col1:
-                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                st.metric("Total CVs Analyzed", len(st.session_state.results))
-                st.markdown('</div>', unsafe_allow_html=True)
+                st.markdown(f"### {job['title']}")
+                st.markdown(f"**{job['department']} | {job['location']}**")
+                st.markdown(f"**Salary:** {job['salary_range']}")
+                st.markdown(f"**Description:** {job['description'][:200]}...")
+                st.markdown(f"*Posted by: {job['created_by_name']} on {job['created_at'][:10]}*")
             
             with col2:
-                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                if st.session_state.results:
-                    avg_score = sum(r.get('score', 0) for r in st.session_state.results) / len(st.session_state.results)
-                    st.metric("Average Match Score", f"{avg_score:.1f}/10")
-                else:
-                    st.metric("Average Match Score", "N/A")
-                st.markdown('</div>', unsafe_allow_html=True)
+                if st.button(f"View Details", key=f"view_{job['id']}"):
+                    st.session_state.selected_job = job['id']
+                    st.rerun()
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+    
+    elif page == "My Applications":
+        st.markdown("## My Applications")
+        
+        applications = get_user_applications(st.session_state.user['id'])
+        
+        if not applications:
+            st.info("You haven't applied to any jobs yet.")
+            return
+        
+        # Display applications
+        for app in applications:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            
+            col1, col2, col3 = st.columns([2, 1, 1])
+            
+            with col1:
+                st.markdown(f"**{app['job_title']}**")
+                st.markdown(f"Applied on: {app['applied_at'][:10]}")
+            
+            with col2:
+                score_class = "score-high" if app['match_score'] >= 7 else "score-medium" if app['match_score'] >= 5 else "score-low"
+                st.markdown(f'<p class="{score_class}">Match: {app["match_score"]}/10</p>', unsafe_allow_html=True)
             
             with col3:
-                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                if st.session_state.results:
-                    top_score = max(r.get('score', 0) for r in st.session_state.results)
-                    st.metric("Top Match Score", f"{top_score:.1f}/10")
-                else:
-                    st.metric("Top Match Score", "N/A")
-                st.markdown('</div>', unsafe_allow_html=True)
+                status_color = "🟢" if app['status'] == 'reviewed' else "🔴" if app['status'] == 'rejected' else "🟡"
+                st.markdown(f"{status_color} {app['status'].title()}")
             
-            # Create charts
-            col1, col2 = st.columns(2)
+            st.markdown('</div>', unsafe_allow_html=True)
+    
+    elif page == "Profile":
+        st.markdown("## My Profile")
+        
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(f"**Full Name:** {st.session_state.user['full_name']}")
+            st.markdown(f"**Username:** {st.session_state.user['username']}")
+            st.markdown(f"**Email:** {st.session_state.user['email']}")
+        
+        with col2:
+            st.markdown(f"**Role:** {st.session_state.user['role'].title()}")
             
-            with col1:
-                st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-                st.plotly_chart(create_candidates_comparison_chart(st.session_state.results), use_container_width=True)
-                st.markdown('</div>', unsafe_allow_html=True)
+            # Application stats
+            apps = get_user_applications(st.session_state.user['id'])
+            st.markdown(f"**Total Applications:** {len(apps)}")
             
-            with col2:
-                st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-                st.plotly_chart(create_top_candidates_pie_chart(st.session_state.results), use_container_width=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Display top skills across all CVs
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Common Skills Across Candidates")
-            
-            all_matched_skills = []
-            for result in st.session_state.results:
-                all_matched_skills.extend(result.get('key_skills_matched', []))
-            
-            # Count frequencies
-            skill_counts = {}
-            for skill in all_matched_skills:
-                if skill in skill_counts:
-                    skill_counts[skill] += 1
-                else:
-                    skill_counts[skill] = 1
-            
-            # Sort by frequency
-            sorted_skills = sorted(skill_counts.items(), key=lambda x: x[1], reverse=True)
-            
-            if sorted_skills:
-                # Display as a horizontal bar chart
-                skills = [s[0] for s in sorted_skills[:10]]  # Top 10 skills
-                counts = [s[1] for s in sorted_skills[:10]]
-                
-                df = pd.DataFrame({
-                    'Skill': skills,
-                    'Count': counts
-                })
-                
-                fig = px.bar(
-                    df, 
-                    y='Skill', 
-                    x='Count', 
-                    orientation='h',
-                    title='Top Skills Among Candidates',
-                    text='Count'
-                )
-                
-                fig.update_layout(
-                    xaxis_title="Number of Candidates",
-                    yaxis_title="",
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    font={'color': 'black'},
-                    height=max(250, 40 * len(skills)),
-                    margin=dict(l=20, r=20, t=50, b=20)
-                )
-                
-                fig.update_traces(marker_color='#4caf50', textposition='outside')
-                
-                st.plotly_chart(fig, use_container_width=True)
+            if apps:
+                reviewed = sum(1 for app in apps if app['status'] == 'reviewed')
+                rejected = sum(1 for app in apps if app['status'] == 'rejected')
+                st.markdown(f"**Reviewed:** {reviewed}")
+                st.markdown(f"**Rejected:** {rejected}")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Handle job detail view
+    if 'selected_job' in st.session_state:
+        job = get_job_by_id(st.session_state.selected_job)
+        if job:
+            job_detail_page(job)
+
+def hr_dashboard():
+    """Display HR dashboard with job management and applications."""
+    st.markdown('<div class="header-container"><h1>HR Dashboard</h1><p>Welcome, ' + st.session_state.user['full_name'] + '</p></div>', unsafe_allow_html=True)
+    
+    # Sidebar navigation
+    st.sidebar.title("HR Navigation")
+    page = st.sidebar.selectbox("Select Page", ["Dashboard", "Create Job", "My Jobs", "All Applications", "Analytics"])
+    
+    if page == "Dashboard":
+        st.markdown("## Dashboard Overview")
+        
+        # Get statistics
+        user_jobs = get_jobs_by_creator(st.session_state.user['id'])
+        applications = get_applications_for_hr(st.session_state.user['id'])
+        
+        # Display metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown(f'<div class="metric-container"><h4>Total Jobs</h4><h2>{len(user_jobs)}</h2></div>', unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f'<div class="metric-container"><h4>Total Applications</h4><h2>{len(applications)}</h2></div>', unsafe_allow_html=True)
+        
+        with col3:
+            reviewed = sum(1 for app in applications if app['status'] == 'reviewed')
+            st.markdown(f'<div class="metric-container"><h4>Reviewed</h4><h2>{reviewed}</h2></div>', unsafe_allow_html=True)
+        
+        with col4:
+            if applications:
+                avg_score = sum(app['match_score'] for app in applications) / len(applications)
+                st.markdown(f'<div class="metric-container"><h4>Avg Score</h4><h2>{avg_score:.1f}/10</h2></div>', unsafe_allow_html=True)
             else:
-                st.info("No common skills found across candidates")
-            st.markdown('</div>', unsafe_allow_html=True)
-    
-    with tabs[2]:  # Comparison Tab
-        if len(st.session_state.results) < 2:
-            st.info("Upload at least two CVs to compare them")
-        else:
-            st.markdown('<div class="header-container"><h2>CV Comparison</h2></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-container"><h4>Avg Score</h4><h2>N/A</h2></div>', unsafe_allow_html=True)
+        
+        # Recent applications
+        st.markdown("## Recent Applications")
+        
+        if applications:
+            recent_apps = applications[:5]  # Show last 5
             
-            # Allow selecting CVs to compare
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Select CVs to Compare")
-            
-            cv_options = [r['filename'] for r in st.session_state.results]
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                cv1 = st.selectbox("First CV:", cv_options, key="cv1_select")
-            with col2:
-                remaining_options = [cv for cv in cv_options if cv != cv1]
-                cv2 = st.selectbox("Second CV:", remaining_options, key="cv2_select")
-            
-            if cv1 and cv2:
-                # Get data for selected CVs
-                cv1_data = next((r for r in st.session_state.results if r['filename'] == cv1), None)
-                cv2_data = next((r for r in st.session_state.results if r['filename'] == cv2), None)
+            for app in recent_apps:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
                 
-                if cv1_data and cv2_data:
-                    # Create comparison charts
-                    st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-                    
-                    # Create radar chart for comparison
-                    categories = ['Overall Match', 'Skills Match', 'Experience Relevance']
-                    
-                    fig = go.Figure()
-                    
-                    # Add first CV
-                    fig.add_trace(go.Scatterpolar(
-                        r=[
-                            cv1_data.get('score', 0),
-                            cv1_data.get('skills_match_score', 0),
-                            cv1_data.get('experience_relevance_score', 0)
-                        ],
-                        theta=categories,
-                        fill='toself',
-                        name=cv1_data['filename'].split('.')[0],
-                        line_color='rgb(76, 175, 80)'
-                    ))
-                    
-                    # Add second CV
-                    fig.add_trace(go.Scatterpolar(
-                        r=[
-                            cv2_data.get('score', 0),
-                            cv2_data.get('skills_match_score', 0),
-                            cv2_data.get('experience_relevance_score', 0)
-                        ],
-                        theta=categories,
-                        fill='toself',
-                        name=cv2_data['filename'].split('.')[0],
-                        line_color='rgb(33, 150, 243)'
-                    ))
-                    
-                    fig.update_layout(
-                        polar=dict(
-                            radialaxis=dict(
-                                visible=True,
-                                range=[0, 10],
-                                tickfont=dict(color='black')
-                            ),
-                            angularaxis=dict(
-                                tickfont=dict(color='black')
-                            )
-                        ),
-                        showlegend=True,
-                        legend=dict(font=dict(color='black')),
-                        paper_bgcolor='rgba(0,0,0,0)',
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        height=400,
-                        margin=dict(l=40, r=40, t=40, b=40)
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    # Compare skills
-                    st.markdown('<div class="card">', unsafe_allow_html=True)
-                    st.subheader("Skills Comparison")
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    # CV1 skills
-                    with col1:
-                        st.markdown(f"### {cv1_data['filename'].split('.')[0]}")
-                        st.markdown("#### Skills Matched")
-                        cv1_matched = cv1_data.get('key_skills_matched', [])
-                        if cv1_matched:
-                            for skill in cv1_matched:
-                                st.markdown(f"<p class='skills-matched'>✓ {skill}</p>", unsafe_allow_html=True)
-                        else:
-                            st.markdown("<p>No matched skills identified</p>", unsafe_allow_html=True)
-                        
-                        st.markdown("#### Skills Missing")
-                        cv1_missing = cv1_data.get('missing_skills', [])
-                        if cv1_missing:
-                            for skill in cv1_missing:
-                                st.markdown(f"<p class='skills-missing'>✗ {skill}</p>", unsafe_allow_html=True)
-                        else:
-                            st.markdown("<p>No missing skills identified</p>", unsafe_allow_html=True)
-                    
-                    # CV2 skills
-                    with col2:
-                        st.markdown(f"### {cv2_data['filename'].split('.')[0]}")
-                        st.markdown("#### Skills Matched")
-                        cv2_matched = cv2_data.get('key_skills_matched', [])
-                        if cv2_matched:
-                            for skill in cv2_matched:
-                                st.markdown(f"<p class='skills-matched'>✓ {skill}</p>", unsafe_allow_html=True)
-                        else:
-                            st.markdown("<p>No matched skills identified</p>", unsafe_allow_html=True)
-                        
-                        st.markdown("#### Skills Missing")
-                        cv2_missing = cv2_data.get('missing_skills', [])
-                        if cv2_missing:
-                            for skill in cv2_missing:
-                                st.markdown(f"<p class='skills-missing'>✗ {skill}</p>", unsafe_allow_html=True)
-                        else:
-                            st.markdown("<p>No missing skills identified</p>", unsafe_allow_html=True)
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    # Summary comparison
-                    st.markdown('<div class="card">', unsafe_allow_html=True)
-                    st.subheader("Summary Comparison")
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.markdown(f"### {cv1_data['filename'].split('.')[0]}")
-                        st.markdown(f"**Overall Score:** {cv1_data.get('score', 0)}/10")
-                        st.markdown(f"**Skills Match:** {cv1_data.get('skills_match_score', 0)}/10")
-                        st.markdown(f"**Experience:** {cv1_data.get('experience_relevance_score', 0)}/10")
-                        st.markdown(f"**Summary:** {cv1_data.get('explanation', 'No summary available.')}")
-                    
-                    with col2:
-                        st.markdown(f"### {cv2_data['filename'].split('.')[0]}")
-                        st.markdown(f"**Overall Score:** {cv2_data.get('score', 0)}/10")
-                        st.markdown(f"**Skills Match:** {cv2_data.get('skills_match_score', 0)}/10")
-                        st.markdown(f"**Experience:** {cv2_data.get('experience_relevance_score', 0)}/10")
-                        st.markdown(f"**Summary:** {cv2_data.get('explanation', 'No summary available.')}")
-                    st.markdown('</div>', unsafe_allow_html=True)
+                col1, col2, col3 = st.columns([2, 1, 1])
+                
+                with col1:
+                    st.markdown(f"**{app['candidate_name']}**")
+                    st.markdown(f"Applied for: {app['job_title']}")
+                    st.markdown(f"Email: {app['candidate_email']}")
+                
+                with col2:
+                    score_class = "score-high" if app['match_score'] >= 7 else "score-medium" if app['match_score'] >= 5 else "score-low"
+                    st.markdown(f'<p class="{score_class}">Score: {app["match_score"]}/10</p>', unsafe_allow_html=True)
+                
+                with col3:
+                    status_color = "🟢" if app['status'] == 'reviewed' else "🔴" if app['status'] == 'rejected' else "🟡"
+                    st.markdown(f"{status_color} {app['status'].title()}")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.info("No applications yet.")
+    
+    elif page == "Create Job":
+        st.markdown("## Create New Job Posting")
+        
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        
+        with st.form("create_job_form"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                title = st.text_input("Job Title *")
+                department = st.text_input("Department")
+                location = st.text_input("Location")
+            
+            with col2:
+                salary_range = st.text_input("Salary Range", placeholder="e.g., $50,000 - $70,000")
+            
+            description = st.text_area("Job Description *", height=200)
+            requirements = st.text_area("Requirements *", height=200)
+            
+            submit_job = st.form_submit_button("Create Job Posting")
+            
+            if submit_job:
+                if not all([title, description, requirements]):
+                    st.error("Please fill in all required fields (*)")
+                else:
+                    if create_job(title, description, requirements, department, location, 
+                                salary_range, st.session_state.user['id']):
+                        st.success("Job posting created successfully!")
+                        st.balloons()
+                    else:
+                        st.error("Failed to create job posting")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    elif page == "My Jobs":
+        st.markdown("## My Job Postings")
+        
+        jobs = get_jobs_by_creator(st.session_state.user['id'])
+        
+        if not jobs:
+            st.info("You haven't created any job postings yet.")
+            return
+        
+        for job in jobs:
+            st.markdown('<div class="job-card">', unsafe_allow_html=True)
+            
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                st.markdown(f"### {job['title']}")
+                st.markdown(f"**{job['department']} | {job['location']}**")
+                st.markdown(f"**Salary:** {job['salary_range']}")
+                st.markdown(f"**Posted on:** {job['created_at'][:10]}")
+                st.markdown(f"**Description:** {job['description'][:200]}...")
+            
+            with col2:
+                # Get application count for this job
+                job_applications = [app for app in get_applications_for_hr(st.session_state.user['id']) 
+                                  if app['job_id'] == job['id']]
+                st.markdown(f"**Applications:** {len(job_applications)}")
+                
+                if job_applications:
+                    avg_score = sum(app['match_score'] for app in job_applications) / len(job_applications)
+                    st.markdown(f"**Avg Score:** {avg_score:.1f}/10")
+            
             st.markdown('</div>', unsafe_allow_html=True)
     
-    with tabs[3]:  # Help Tab
-        st.markdown('<div class="header-container"><h2>Help & Instructions</h2></div>', unsafe_allow_html=True)
+    elif page == "All Applications":
+        st.markdown("## All Applications")
         
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("How to Use This App")
+        applications = get_applications_for_hr(st.session_state.user['id'])
         
-        st.markdown("""
-        ### Getting Started
-        1. Enter your OpenAI API key in the API Settings section (necessary for CV analysis)
-        2. Enter a job description or use the provided sample
-        3. Upload one or more CVs in PDF format
-        4. Wait for the analysis to complete
+        if not applications:
+            st.info("No applications received yet.")
+            return
         
-        ### Features
-        - **Analysis Tab**: View detailed analysis of each CV, including skills match, experience relevance, and personalized feedback
-        - **Dashboard Tab**: View aggregate statistics and comparisons across all uploaded CVs
-        - **Comparison Tab**: Directly compare two candidates side-by-side
+        # Filter options
+        col1, col2 = st.columns(2)
         
-        ### Tips for Best Results
-        - Provide a detailed job description with clear requirements
-        - Use PDF CVs with good text extraction quality
-        - For best results, upload CVs in a standard format
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
+        with col1:
+            status_filter = st.selectbox("Filter by Status", ["All", "reviewed", "rejected", "pending"])
         
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("About")
+        with col2:
+            job_titles = list(set([app['job_title'] for app in applications]))
+            job_filter = st.selectbox("Filter by Job", ["All"] + job_titles)
         
-        st.markdown("""
-        This CV Analyzer application helps HR professionals and recruiters streamline the candidate screening process.
+        # Apply filters
+        filtered_apps = applications
+        if status_filter != "All":
+            filtered_apps = [app for app in filtered_apps if app['status'] == status_filter]
+        if job_filter != "All":
+            filtered_apps = [app for app in filtered_apps if app['job_title'] == job_filter]
         
-        Features:
-        - AI-powered CV analysis based on job requirements
-        - Skills matching and experience validation
-        - Interview question generation
-        - Personalized candidate feedback
-        - Visual comparisons and insights
+        # Display applications
+        for app in filtered_apps:
+            st.markdown('<div class="application-detail">', unsafe_allow_html=True)
+            
+            # Header
+            col1, col2, col3 = st.columns([2, 1, 1])
+            
+            with col1:
+                st.markdown(f"### {app['applicant_full_name']}")
+                st.markdown(f"**Position:** {app['job_title']}")
+                st.markdown(f"**Email:** {app['applicant_email']}")
+                st.markdown(f"**Phone:** {app['applicant_phone']}")
+            
+            with col2:
+                score_class = "score-high" if app['match_score'] >= 7 else "score-medium" if app['match_score'] >= 5 else "score-low"
+                st.markdown(f'<p class="{score_class}">Overall: {app["match_score"]}/10</p>', unsafe_allow_html=True)
+                st.markdown(f"Skills: {app['skills_score']}/10")
+                st.markdown(f"Experience: {app['experience_score']}/10")
+            
+            with col3:
+                status_color = "🟢" if app['status'] == 'reviewed' else "🔴" if app['status'] == 'rejected' else "🟡"
+                st.markdown(f"{status_color} **{app['status'].title()}**")
+                st.markdown(f"Applied: {app['applied_at'][:10]}")
+            
+            # Expandable details
+            with st.expander("View Details"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**Professional Info:**")
+                    st.markdown(f"- Total Experience: {app['total_experience']}")
+                    st.markdown(f"- Current Salary: {app['current_salary']}")
+                    st.markdown(f"- Expected Salary: {app['expected_salary']}")
+                
+                with col2:
+                    st.markdown("**Skills Analysis:**")
+                    if app['matched_skills']:
+                        st.markdown(f"- Matched Skills: {', '.join(app['matched_skills'])}")
+                    if app['missing_skills']:
+                        st.markdown(f"- Missing Skills: {', '.join(app['missing_skills'])}")
+                
+                if app['experience_summary']:
+                    st.markdown("**Experience Summary:**")
+                    st.markdown(app['experience_summary'])
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+    
+    elif page == "Analytics":
+        st.markdown("## Analytics Dashboard")
         
-        The app uses OpenAI's GPT models to analyze CV content against job descriptions, providing objective scoring and recommendations.
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
+        applications = get_applications_for_hr(st.session_state.user['id'])
         
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("FAQ")
+        if not applications:
+            st.info("No data available for analytics.")
+            return
         
-        expander1 = st.expander("Why do I need an OpenAI API key?")
-        expander1.markdown("""
-        This application uses OpenAI's GPT models to analyze CV content, extract work experience, and generate personalized feedback.
-        The API key is required to access these AI capabilities. Your API key is used only within this application and is not stored permanently.
-        """)
+        # Create charts
+        col1, col2 = st.columns(2)
         
-        expander2 = st.expander("How is the match score calculated?")
-        expander2.markdown("""
-        The match score is calculated by analyzing several factors:
-        - Skills match: How well the candidate's skills align with the job requirements
-        - Experience relevance: How relevant the candidate's work experience is to the role
-        - Experience duration: Whether the candidate has sufficient experience in relevant areas
+        with col1:
+            # Application status distribution
+            status_counts = {}
+            for app in applications:
+                status = app['status']
+                status_counts[status] = status_counts.get(status, 0) + 1
+            
+            fig_status = px.pie(
+                values=list(status_counts.values()),
+                names=list(status_counts.keys()),
+                title="Application Status Distribution"
+            )
+            st.plotly_chart(fig_status, use_container_width=True)
         
-        The AI considers both explicit skills mentioned and implicit capabilities that can be inferred from the CV.
-        """)
+        with col2:
+            # Score distribution
+            scores = [app['match_score'] for app in applications]
+            fig_scores = px.histogram(
+                x=scores,
+                nbins=10,
+                title="Match Score Distribution",
+                labels={'x': 'Match Score', 'y': 'Count'}
+            )
+            st.plotly_chart(fig_scores, use_container_width=True)
         
-        expander3 = st.expander("Are my CV files and data secure?")
-        expander3.markdown("""
-        Yes. Your files are processed temporarily and are not stored permanently after analysis.
-        The application runs locally in your browser, and data is sent to OpenAI only for analysis purposes.
-        No CV data is retained after you close the application or refresh the browser.
-        """)
+        # Applications over time
+        df_apps = pd.DataFrame(applications)
+        df_apps['applied_date'] = pd.to_datetime(df_apps['applied_at']).dt.date
+        apps_by_date = df_apps.groupby('applied_date').size().reset_index(name='count')
         
-        expander4 = st.expander("Can the app analyze CVs in languages other than English?")
-        expander4.markdown("""
-        Yes, the application can analyze CVs in multiple languages, though performance may be best with English content.
-        The OpenAI models used for analysis have multilingual capabilities, but for optimal results with non-English CVs,
-        consider providing the job description in the same language.
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
+        fig_timeline = px.line(
+            apps_by_date,
+            x='applied_date',
+            y='count',
+            title="Applications Over Time"
+        )
+        st.plotly_chart(fig_timeline, use_container_width=True)
+
+def main():
+    """Main application function."""
+    st.set_page_config(page_title="CV Analyzer", page_icon="📄", layout="wide")
+    
+    # Initialize database
+    init_database()
+    
+    # Set custom styling
+    set_custom_styling()
+    
+    # Check if user is logged in
+    if 'user' not in st.session_state:
+        login_page()
+    else:
+        # Display appropriate dashboard based on user role
+        if st.session_state.user['role'] == 'hr':
+            hr_dashboard()
+        else:
+            candidate_dashboard()
+        
+        # Logout button in sidebar
+        st.sidebar.markdown("---")
+        if st.sidebar.button("Logout"):
+            # Clear session state
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
 
 if __name__ == "__main__":
     main()
